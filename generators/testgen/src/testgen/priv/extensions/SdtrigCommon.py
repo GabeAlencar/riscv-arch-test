@@ -886,6 +886,8 @@ def _generate_address_matches_tests(test_data: TestData, mode: str) -> list[Test
     covergroup = f"Sdtrig{mode}_address_matches_cg"
     chunks: list[TestChunk] = []
 
+    data_reg, temp_reg = test_data.int_regs.get_registers(2)
+
     ######################################
     coverpoint = "cp_tdata2_translate"
     ######################################
@@ -893,20 +895,73 @@ def _generate_address_matches_tests(test_data: TestData, mode: str) -> list[Test
     lines.append(
         comment_banner(
             coverpoint,
-            "tdata2 holds full-width virtual/physical addresses across satp modes;\nhigh bit reads back",
+            "tdata2 holds valid addresses in the widest supported translation mode\n"
+            "zero, walking 1s, and walking 0s read back unchanged (VAs sign-extended, PAs zero-extended)",
         )
     )
+
+    def readback(binname: str, val: str) -> list[str]:
+        return [
+            _add_tc(test_data, binname, coverpoint, covergroup),
+            f"LI(x{data_reg}, {val})",
+            _csr_access(f"csrw tdata2, x{data_reg}", mode),
+            _csr_access(f"csrr x{data_reg}, tdata2 # read back", mode),
+            write_sigupd(data_reg, test_data),
+        ]
+
+    # Widest supported mode only: (satp mode, #if/#elif condition, highest walked bit, xlen)
+    # Walked bits stop below the VA sign bit, so walking 1s are positive and walking 0s are sign-extended VAs
+    svmodes = (
+        ("sv57", "__riscv_xlen == 64 && defined(SV57_SUPPORTED)", 55, 64),
+        ("sv48", "__riscv_xlen == 64 && defined(SV48_SUPPORTED)", 46, 64),
+        ("sv39", "__riscv_xlen == 64 && defined(SV39_SUPPORTED)", 37, 64),
+        ("sv32", "__riscv_xlen == 32 && defined(SV32_SUPPORTED)", 31, 32),
+        # Bare walks bits PLEN-1:0; each bit is guarded by UDB_PHYS_ADDR_WIDTH below
+        ("bare", "defined(UDB_PHYS_ADDR_WIDTH) && UDB_PHYS_ADDR_WIDTH < __riscv_xlen", 62, 64),
+    )
     for trig_num in range(UDB_NUM_TRIGGERS):
-        # RV64 satp modes; RV32 uses (bare, sv32)
-        for satp in ("bare", "sv39", "sv48", "sv57"):
-            for msb in (0, 1):  # tdata2 high bit
-                binname = f"trig_num_{trig_num}_satp_{satp}_msb_{msb}"
+        lines.extend(
+            [
+                f"\n#ifdef UDB_SDTRIG_MCONTROL6_SUPPORTED{trig_num}",
+                *_config_mcontrol6(temp_reg, trig_num, 0, mode, privbits=0, select=0),
+                "\n#ifdef UDB_TDATA2_AVAILABLE",
+            ]
+        )
+        for idx, (svmode, cond, msb, xlen) in enumerate(svmodes):
+            lines.append(f"\n{'#if' if idx == 0 else '#elif'} {cond}")
+            vm_on = (
+                svmode != "bare" and mode != "U"
+            )  # U-mode cannot fetch through the supervisor-only boot identity map
+            if vm_on:
+                satp_shift = 31 if svmode == "sv32" else 60
                 lines.extend(
                     [
-                        _add_tc(test_data, binname, coverpoint, covergroup),
+                        f"# turn on {svmode} translation using the boot identity-mapped root page table",
+                        f"LA(x{data_reg}, rvtest_Sroot_pg_tbl)",
+                        f"srli x{data_reg}, x{data_reg}, 12",
+                        f"LI(x{temp_reg}, SATP_MODE_{svmode.upper()} << {satp_shift})",
+                        f"or x{data_reg}, x{data_reg}, x{temp_reg}",
+                        f"csrw satp, x{data_reg}",
+                        "sfence.vma",
                     ]
                 )
+            lines.extend(readback(f"trig_num_{trig_num}_satp_{svmode}_zero", "0x0"))
+            for walk in (1, 0):
+                for bit in range(msb + 1):
+                    if svmode == "bare":
+                        ones = "((1 << UDB_PHYS_ADDR_WIDTH) - 1)"
+                        val = f"(1 << {bit})" if walk else f"({ones} ^ (1 << {bit}))"
+                        lines.append(f"#if {bit} < UDB_PHYS_ADDR_WIDTH")
+                    else:
+                        val = f"0x{(1 << bit) if walk else ((1 << xlen) - 1) ^ (1 << bit):x}"
+                    lines.extend(readback(f"trig_num_{trig_num}_satp_{svmode}_walk{walk}_bit_{bit}", val))
+                    if svmode == "bare":
+                        lines.append("#endif")
+            if vm_on:
+                lines.extend(["\n# turn off translation", "csrw satp, x0", "sfence.vma"])
+        lines.extend(["#endif", "#endif", *_disable_trigger(temp_reg, trig_num, mode), "#endif"])
 
+    test_data.int_regs.return_registers([data_reg, temp_reg])
     chunks.append(test_data.end_test_chunk())
     return chunks
 
@@ -1973,6 +2028,13 @@ def register_sdtrig_suite(mode: str, required_extensions: list[str | list[str]],
     @add_priv_test_generator(
         suite, required_extensions=required_extensions, march_extensions=[], extra_defines=extra_defines
     )
+    def make_sdtrig_address_matches(test_data: TestData) -> list[TestChunk]:
+        """tdata2 address-storage tests."""
+        return _generate_address_matches_tests(test_data, mode)
+
+    @add_priv_test_generator(
+        suite, required_extensions=required_extensions, march_extensions=[], extra_defines=extra_defines
+    )
     def make_sdtrig_mcontrol6(test_data: TestData) -> list[TestChunk]:
         """mcontrol6 tests."""
         return _generate_mcontrol6_tests(test_data, mode)
@@ -1995,4 +2057,4 @@ def register_sdtrig_suite(mode: str, required_extensions: list[str | list[str]],
     #   _generate_a_tests: [["Zaamo", "Zalrsc"]]
     #   _generate_cm_push_pop_tests: [["Zcmp"]]
     #   _generate_cache_operations_tests: [["Zicbom", "Zicbop", "Zicboz"]]
-    #   _generate_address_matches_tests, _generate_csr_tests, _generate_etrigger_tests, _generate_textra_tests
+    #   _generate_csr_tests, _generate_etrigger_tests, _generate_textra_tests
