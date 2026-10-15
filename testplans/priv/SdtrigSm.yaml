@@ -188,7 +188,7 @@ coverpoints:
       tdata1.select = 0 (adr)
       tdata1.XSL = {100/010/001}
       tdata1.size = {0,1,2,3,4,5,6}
-      sp = scratch+16
+      sp = scratch+16 for cm.push and scratch for cm.pop (both access the 16-byte frame at scratch)
       cm.push {ra, s0}, -16
       cm.pop{ra, s0}, 16
     expectation: Breakpoint exception if the tdata2 matches mem address, store/load = 1, tdata1.size = XLEN or 0
